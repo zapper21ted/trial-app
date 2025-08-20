@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ops Assistant — Chat Widget (Guarded)</title>
+  <script src="https://cdn.jsdelivr.net/npm/monday-sdk-js/dist/monday-sdk.min.js"></script>
+  <style>
+    :root { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f6f7fb; color: #202124; }
+    .wrap { max-width: 880px; margin: 0 auto; padding: 16px 18px 32px; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .chat { background:#fff; border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,.07); padding:12px; }
+    #log { height: 260px; overflow:auto; padding:8px; border:1px solid #eceff4; border-radius:12px; background:#fafbff; }
+    .u, .a { margin:8px 0; padding:10px 12px; border-radius:12px; max-width: 90%; line-height:1.4; }
+    .u { background:#e3f2fd; align-self:flex-end; }
+    .a { background:#ffffff; border:1px solid #eceff4; }
+    .row { display:flex; align-items:center; gap:10px; margin-top:10px; }
+    input[type=text]{ flex:1; padding:10px 12px; border:1px solid #dfe3ea; border-radius:10px; outline:none; }
+    button { border:0; padding:10px 14px; border-radius:10px; cursor:pointer; background:#1f76ff; color:white; }
+    button:disabled{ background:#c5d7ff; cursor:not-allowed; }
+    .muted{ color:#5f6368; }
+    .pill{ display:inline-block; padding:3px 8px; border-radius:999px; background:#eef2ff; margin-right:6px; font-size:12px; }
+    .kpi{ font-weight:700; }
+    .flexcol{ display:flex; flex-direction:column; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Ops Assistant — Dashboard Chat</h1>
+    <div class="muted">Pick boards in the widget settings, then ask a question.</div>
+  </header>
+  <div class="chat flexcol">
+    <div id="log" class="flexcol"></div>
+    <div class="row">
+      <input id="q" type="text" placeholder='e.g., "How many jobs are Uploaded or Pending for over a week?"'>
+      <button id="ask">Ask</button>
+    </div>
+  </div>
+</div>
+<script>
+const monday = window.mondaySdk();
+
+// === Guard: refuse to run outside monday.com ===
+(async () => {
+  try {
+    const ctx = await monday.get("context");
+    if (!ctx || !ctx.data) throw new Error("No Monday context");
+  } catch (e) {
+    document.body.innerHTML = '<div style="font-family:system-ui;padding:24px"><h2>Restricted</h2><p>This widget only runs inside monday.com.</p></div>';
+    throw e;
+  }
+})();
+
+// === CONFIG you can tweak ===
+const FALLBACK_STATUS_COLUMN_TITLES = ["Job Status", "Status"]; // we'll also auto-detect by labels
+const STATUS_CHANGED_DATE_TITLE = "Status Changed"; // optional Date column auto-set by Monday automation
+const DEFAULT_TARGET_STATUSES = ["Uploaded and Pending", "Uploaded and Pendi...", "Uploaded", "Pending"]; // we intersect with real labels
+const DEFAULT_MIN_AGE_DAYS = 7;
+
+// ===== helpers =====
+const daysToMs = (d)=> d*24*60*60*1000;
+const toISODate = (d)=> new Date(d).toISOString().slice(0,10);
+const addMsg = (cls, textHTML)=>{
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = cls;
+  div.innerHTML = textHTML;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+};
+const say = (t)=> addMsg('a', t);
+const you = (t)=> addMsg('u', t.replace(/</g,'&lt;'));
+
+async function getSelectedBoards(){
+  const { data } = await monday.get("settings");
+  return (data && data.boardIds) ? data.boardIds : [];
+}
+
+async function fetchColumns(boardId){
+  const q = `query($ids:[ID!]!){
+    boards(ids:$ids){
+      id name
+      columns { id title type settings_str }
+    }
+  }`;
+  const res = await monday.api(q, { variables: { ids: [boardId] } });
+  return res?.data?.boards?.[0];
+}
+
+function parseStatusLabels(settings_str){
+  try{
+    const s = JSON.parse(settings_str || "{}");
+    const labels = s.labels || {};
+    return Object.values(labels).filter(Boolean);
+  }catch{ return []; }
+}
+
+function chooseStatusColumn(board){
+  const byTitle = {};
+  for(const c of board.columns) byTitle[(c.title||'').trim().toLowerCase()] = c;
+  for(const t of FALLBACK_STATUS_COLUMN_TITLES){
+    const c = byTitle[t.toLowerCase()];
+    if (c && c.type === "status") return c;
+  }
+  const targets = DEFAULT_TARGET_STATUSES.map(x=>x.toLowerCase());
+  for (const c of board.columns){
+    if (c.type !== "status") continue;
+    const labels = parseStatusLabels(c.settings_str).map(x=>x.toLowerCase());
+    if (labels.some(lbl => targets.includes(lbl))) return c;
+  }
+  return board.columns.find(c => c.type === "status") || null;
+}
+
+function findDateColumn(board, title){
+  const lc = title.toLowerCase();
+  return board.columns.find(c => c.type === "date" && (c.title||"").trim().toLowerCase() === lc) || null;
+}
+
+async function fetchItemsWithColumns(boardId, colIds){
+  const q = `query($boardId:ID!, $limit:Int!, $cursor:String, $colIds:[String!]){
+    boards(ids: [$boardId]) {
+      items_page(limit: $limit, cursor: $cursor){
+        items {
+          id name
+          column_values(ids:$colIds){ id text value updated_at }
+        }
+        cursor
+      }
+    }
+  }`;
+  let cursor = null, items = [];
+  do{
+    const res = await monday.api(q, { variables: { boardId, limit: 200, cursor, colIds } });
+    const page = res?.data?.boards?.[0]?.items_page;
+    items = items.concat(page?.items || []);
+    cursor = page?.cursor || null;
+  } while(cursor);
+  return items;
+}
+
+function parseDateFromColumnValue(cv){
+  if (!cv) return null;
+  try{
+    if (cv.value){
+      const v = JSON.parse(cv.value);
+      if (v && v.date) return new Date(v.date + "T00:00:00");
+    }
+  }catch{}
+  if (cv.updated_at) return new Date(cv.updated_at);
+  return null;
+}
+
+async function countByStatusAge(boardIds, minDays){
+  const threshold = Date.now() - daysToMs(minDays);
+  let total = 0;
+  const perBoard = [];
+  const matches = [];
+
+  for (const id of boardIds){
+    const meta = await fetchColumns(id);
+    if (!meta){ perBoard.push({boardId:id, boardName:'Board '+id, count:0, note:'No access/meta'}); continue; }
+    const statusCol = chooseStatusColumn(meta);
+    if (!statusCol){ perBoard.push({boardId:id, boardName:meta.name, count:0, note:'No status column'}); continue; }
+
+    const dateCol = findDateColumn(meta, STATUS_CHANGED_DATE_TITLE);
+    const colIds = dateCol ? [statusCol.id, dateCol.id] : [statusCol.id];
+    const items = await fetchItemsWithColumns(id, colIds);
+
+    const allowedLabels = parseStatusLabels(statusCol.settings_str);
+    const targets = DEFAULT_TARGET_STATUSES.filter(x => allowedLabels.includes(x));
+
+    let count = 0;
+    for (const it of items){
+      const cvMap = {};
+      for (const cv of (it.column_values||[])) cvMap[cv.id] = cv;
+
+      const statusText = (cvMap[statusCol.id]?.text || "").trim();
+      if (!targets.includes(statusText)) continue;
+
+      let since = null;
+      if (dateCol) since = parseDateFromColumnValue(cvMap[dateCol.id]);
+      if (!since) since = parseDateFromColumnValue(cvMap[statusCol.id]);
+      if (!since) continue;
+
+      if (since.getTime() <= threshold){
+        count++;
+        total++;
+        matches.push({ boardId: id, boardName: meta.name, itemId: it.id, name: it.name, status: statusText, since: toISODate(since) });
+      }
+    }
+    perBoard.push({ boardId: id, boardName: meta.name, count });
+  }
+
+  perBoard.sort((a,b)=> b.count - a.count);
+  return { total, perBoard, matches };
+}
+
+// Naive intent parser for your exact question
+function isUploadedPendingOverWeek(q){
+  const s = q.toLowerCase();
+  const hasStatus = (s.includes('uploaded') || s.includes('pending'));
+  const hasAge = (s.includes('over a week') || s.includes('> 7') || s.includes('7 days') || s.includes('more than a week'));
+  return hasStatus && hasAge;
+}
+
+async function handleQuestion(q){
+  you(q);
+  const boards = await getSelectedBoards();
+  if (!boards.length) {
+    return say('No boards selected. Open widget <b>Settings</b> and choose boards, then ask again.');
+  }
+
+  if (isUploadedPendingOverWeek(q)){
+    say('Working on it…');
+    try{
+      const result = await countByStatusAge(boards, DEFAULT_MIN_AGE_DAYS);
+      const top = result.perBoard.filter(x=>x.count>0).slice(0,5);
+      let html = `Across <b>${boards.length}</b> board(s): <span class="pill">≥ ${DEFAULT_MIN_AGE_DAYS} days</span><br>` +
+                 `Status: <span class="pill">Uploaded</span> / <span class="pill">Pending</span><br>` +
+                 `<div style="margin-top:6px">Total matches: <b class="kpi">${result.total}</b></div>`;
+      if (top.length){
+        html += `<div class="muted" style="margin-top:6px">Top boards:</div><ul>` +
+                top.map(x=> `<li>${x.boardName}: <b>${x.count}</b></li>`).join("") +
+                `</ul>`;
+      }
+      const sample = result.matches.slice(0,10).map(m => 
+        `#${m.itemId} ${m.name} — <i>${m.status} since ${m.since}</i> <span class="muted">(${m.boardName})</span>`
+      );
+      if (sample.length){
+        html += `<div class="muted" style="margin-top:6px">Examples:</div><ul>` + sample.map(s=>`<li>${s}</li>`).join("") + `</ul>`;
+        if (result.matches.length > sample.length){
+          html += `<div class="muted" style="margin-top:4px">…and ${result.matches.length - sample.length} more</div>`;
+        }
+      }
+      return say(html);
+    }catch(e){
+      console.error(e);
+      return say('⚠️ Error: ' + (e.message || e.toString()));
+    }
+  }
+
+  say('I can answer: “How many jobs are Uploaded or Pending for over a week?”<br>' +
+      'Try variations like <i>“count uploaded and pending older than 7 days.”</i>');
+}
+
+document.getElementById('ask').addEventListener('click', ()=>{
+  const q = document.getElementById('q');
+  if (!q.value.trim()) return;
+  handleQuestion(q.value.trim());
+  q.value='';
+});
+document.getElementById('q').addEventListener('keydown', (e)=>{
+  if (e.key === 'Enter'){ document.getElementById('ask').click(); }
+});
+</script>
+</body>
+</html>
